@@ -4,11 +4,10 @@ import google.auth
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.cloud import storage
-from google.oauth2.credentials import Credentials # Added for YouTube
+from google.oauth2.credentials import Credentials
 
 # --- CONFIGURATION ---
-# We use the Mount Path to avoid OOM crashes (RAM usage)
-MOUNT_PATH = Path("/mnt/townhall-bucket") 
+MOUNT_PATH = Path("/mnt/townhall-bucket")
 ASSETS_PREFIX = os.environ.get("ASSETS_PREFIX", "assets")
 DRIVE_OUTPUT_FOLDER_ID = os.environ.get("DRIVE_OUTPUT_FOLDER_ID")
 SKIP_DRIVE_UPLOAD = os.environ.get("SKIP_DRIVE_UPLOAD", "0") == "1"
@@ -27,7 +26,6 @@ def drive():
     ]), cache_discovery=False)
 
 def youtube():
-    # Added: OAuth Logic for User Channel Uploads
     if "YOUTUBE_REFRESH_TOKEN" in os.environ:
         c = Credentials(
             None, 
@@ -58,14 +56,12 @@ def dl_drive(file_id: str, dest: Path):
         while not done:
             _, done = downloader.next_chunk()
     
-    # ADDED: Critical Safety Check for "Corrupt" Downloads
     size_mb = dest.stat().st_size / (1024*1024)
     if size_mb < 1.0:
         raise RuntimeError(f"Downloaded file is too small ({size_mb:.2f}MB). Check Drive permissions!")
 
 def run_ffmpeg(args: list):
     print(f"Running FFmpeg: {' '.join(args)}")
-    # Added 'check=True' to raise error immediately if it fails
     subprocess.run(["ffmpeg"] + args, text=True, check=True)
 
 def upload_drive(local: Path, out_name: str):
@@ -83,18 +79,46 @@ def upload_gcs(local: Path, object_name: str):
     blob.upload_from_filename(str(local), content_type="video/mp4")
     return f"gs://{blob.bucket.name}/{blob.name}"
 
-def upload_yt(local: Path, title: str, desc: str):
+# --- UPDATED: Modified to accept thumbnail path ---
+def upload_yt(local: Path, title: str, desc: str, thumb_path: Path = None):
     yt = youtube()
     if not yt: return "Skipped (No Auth)"
+    
+    print(f"Uploading video to YouTube: {title}")
     body = {
         "snippet": {"title": title, "description": desc, "categoryId": "22"},
         "status": {"privacyStatus": "unlisted"}
     }
     media = MediaFileUpload(str(local), mimetype="video/mp4", resumable=True)
     req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+    
     resp = None
-    while resp is None: _, resp = req.next_chunk()
-    return f"https://youtu.be/{resp['id']}"
+    while resp is None: 
+        status, resp = req.next_chunk()
+        if status:
+            print(f"Upload progress: {int(status.progress() * 100)}%")
+            
+    video_id = resp['id']
+    video_url = f"https://youtu.be/{video_id}"
+    print(f"Video Uploaded! ID: {video_id}")
+
+    # --- THUMBNAIL LOGIC ---
+    if thumb_path and thumb_path.exists():
+        print(f"Uploading thumbnail from {thumb_path}...")
+        try:
+            req_thumb = yt.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(str(thumb_path), mimetype='image/jpeg')
+            )
+            req_thumb.execute()
+            print("Thumbnail set successfully.")
+        except Exception as e:
+            print(f"WARNING: Failed to upload thumbnail: {e}")
+    else:
+        if thumb_path:
+            print(f"WARNING: Thumbnail path provided but file not found: {thumb_path}")
+
+    return video_url
 
 # --- MAIN PROCESS ---
 def process(drive_url: str, output_name: str, yt_title=None, yt_desc=None):
@@ -109,18 +133,20 @@ def process(drive_url: str, output_name: str, yt_title=None, yt_desc=None):
         print("Downloading from Drive...")
         dl_drive(fid, main)
         
-        # CHANGED: Use Volume Mounts instead of dl_gcs (Fixes Memory Crash)
         assets = MOUNT_PATH / ASSETS_PREFIX
         bg = assets/"background.mp4"
         outro = assets/"outro.mp4"
         music = assets/"music.mp3"
+        
+        # --- NEW: Define Thumbnail Path ---
+        # Assuming it is located at /mnt/townhall-bucket/assets/thumbnail.jpg
+        thumbnail = assets/"thumbnail.jpg"
 
-        # Verify assets exist
+        # Verify critical video assets (thumbnail is optional, so we don't crash if missing)
         for p in [bg, outro, music]:
             if not p.exists(): raise RuntimeError(f"Missing asset on mount: {p}")
 
-        # 2) FFmpeg Graph (Your Original Filter Logic)
-        # Note: I added 'pad' to the scale filters to prevent aspect ratio crashes
+        # 2) FFmpeg Graph
         filter_complex = (
           "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2[bg];"
           "[0:v]scale=1400:-1[fg];"
@@ -130,7 +156,7 @@ def process(drive_url: str, output_name: str, yt_title=None, yt_desc=None):
           "[3:a]asplit=2[a_intro_src][a_outro_src];"
           "[a_intro_src]atrim=0:5,afade=t=in:st=0:d=2,afade=t=out:st=3:d=2[aintro];"
           "[a_outro_src]atrim=0:12,afade=t=in:st=0:d=3,afade=t=out:st=9:d=3[aoutro];"
-          "[0:a]anull[main];" # NOTE: Ensure main.mp4 actually has audio or this 'anull' might fail if stream missing
+          "[0:a]anull[main];"
           "[aintro][main]amix=inputs=2[intro_mix];"
           "[intro_mix][aoutro]concat=n=2:v=0:a=1[aout]"
         )
@@ -156,7 +182,9 @@ def process(drive_url: str, output_name: str, yt_title=None, yt_desc=None):
             result["gcs"] = upload_gcs(out, key)
 
         if yt_title:
-            result["youtube"] = upload_yt(out, yt_title, yt_desc or "")
+            # --- UPDATED: Pass the thumbnail path here ---
+            print(f"Title provided: '{yt_title}'. Attempting YouTube upload with thumbnail...")
+            result["youtube"] = upload_yt(out, yt_title, yt_desc or "", thumb_path=thumbnail)
             
         print(json.dumps(result, indent=2))
 
